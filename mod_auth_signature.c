@@ -40,6 +40,7 @@ typedef struct {
     int no_signature_check_in_authentication;
     int allowed_clock_skew;
     int add_basic_auth;
+    int set_environment;
 } auth_signature_config_rec;
 
 module AP_MODULE_DECLARE_DATA auth_signature_module;
@@ -67,6 +68,9 @@ static const command_rec auth_signature_cmds[] =
     AP_INIT_FLAG("AuthSignatureAddBasicAuth", ap_set_flag_slot,
 	(void *)APR_OFFSETOF(auth_signature_config_rec, add_basic_auth),
 	OR_AUTHCFG, "Also add a Basic auth header element"),
+    AP_INIT_FLAG("AuthSignatureSetEnvironment", ap_set_flag_slot,
+	(void *)APR_OFFSETOF(auth_signature_config_rec, set_environment),
+	OR_AUTHCFG, "Put returned attributes into the environment"),
     {NULL}
 };
 
@@ -80,6 +84,7 @@ static void *create_auth_signature_dir_config(apr_pool_t *p, char *d)
     conf->no_signature_check_in_authentication = 0;
     conf->allowed_clock_skew = 300;
     conf->add_basic_auth = 0;
+    conf->set_environment = 0;
     return conf;
 }
 
@@ -255,12 +260,40 @@ static const char *make_allowed_signers_from_env(request_rec *r, const char *key
     return write_into_tmpfile(r, tempdir, "authallowed-XXXXXX", allowed, strlen(allowed));
 }
 
+static void set_environment_vars(request_rec *r, const char *environmentfile, const char *prefix)
+{
+    char buffer[MAX_STRING_LEN];
+    apr_file_t *inf;
+
+    if ((apr_file_open(&inf, environmentfile, APR_READ | APR_BINARY, APR_OS_DEFAULT, r->pool)) != APR_SUCCESS)
+	return;
+    while (APR_SUCCESS == apr_file_gets(buffer, sizeof(buffer)-1, inf)) {
+	size_t i, len = strlen(buffer);
+	if (len && buffer[len-1] == '\n')
+	    buffer[--len] = 0;
+	if (len && buffer[len-1] == '\r')
+	    buffer[--len] = 0;
+	for (i = 0; buffer[i]; i++) {
+	    buffer[i] = apr_toupper(buffer[i]);
+	    if (buffer[i] == '=')
+		break;
+	}
+	if (buffer[i] != '=')
+	    continue;
+	ap_log_rerror(APLOG_MARK, APLOG_DEBUG|APLOG_NOERRNO, 0, r, ERRTAG "setting environment %s%s", prefix, buffer);
+	buffer[i++] = 0;
+	apr_table_setn(r->subprocess_env, apr_pstrcat(r->pool, prefix, buffer, NULL), apr_pstrdup(r->pool, buffer + i));
+    }
+    apr_file_close(inf);
+}
+
 static int verify_signature(request_rec *r, auth_signature_config_rec *conf, const char *keyid, const char *algorithm, const char *signdata, const char *signature, int signature_length)
 {
-    const char *argv[8];
+    const char *argv[9];
     const char *tempdir;
     const char *signaturefile;
     const char *signdatafile;
+    const char *environmentfile = NULL;
     const char *allowedsigners = NULL;
     int res;
 
@@ -290,19 +323,34 @@ static int verify_signature(request_rec *r, auth_signature_config_rec *conf, con
 	    return HTTP_UNAUTHORIZED;
 	}
     }
+    if (conf->set_environment) {
+	environmentfile = write_into_tmpfile(r, tempdir, "authenv-XXXXXX", "", 0);
+	if (!environmentfile) {
+	    apr_file_remove(signaturefile, r->pool);
+	    apr_file_remove(signdatafile, r->pool);
+	    if (allowedsigners && allowedsigners != conf->ssh_allowed_signers_file)
+		apr_file_remove(allowedsigners, r->pool);
+	    return HTTP_UNAUTHORIZED;
+	}
+    }
     argv[0] = conf->verification_program;
     argv[1] = ap_auth_name(r);
     argv[2] = keyid;
     argv[3] = algorithm ? algorithm : "";
     argv[4] = signaturefile;
     argv[5] = signdatafile;
-    argv[6] = allowedsigners;	/* optional */
-    argv[7] = NULL;
+    argv[6] = allowedsigners ? allowedsigners : (environmentfile ? "" : NULL);	/* optional */
+    argv[7] = environmentfile;	/* optional */
+    argv[8] = NULL;
     res = run_external_verify(r, argv[0], argv);
     apr_file_remove(signaturefile, r->pool);
     apr_file_remove(signdatafile, r->pool);
     if (allowedsigners && allowedsigners != conf->ssh_allowed_signers_file)
 	apr_file_remove(allowedsigners, r->pool);
+    if (environmentfile) {
+	set_environment_vars(r, environmentfile, AUTHN_PREFIX);
+	apr_file_remove(environmentfile, r->pool);
+    }
     return res;
 }
 
